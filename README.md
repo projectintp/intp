@@ -1,3 +1,9 @@
+# What is IntP?
+
+IntP tool has the objective of measurement the interference of direct applications in linux operational systems.
+
+Meaning of Interference: is the overhead generated in an aplication running in a consolidated environemnt with other applications due to contention in accessing shared resources
+
 # How to install IntP
 
 Assuming that apt-get package is installed in the system, these packages can be installed with. Make sure to install the required kernel information packages before using IntP:
