@@ -2,7 +2,7 @@
 
 IntP is a tool to measure the interference of direct applications in linux operational systems.
 
-Meaning of interference: is the overhead generated in an aplication running in a consolidated environemnt with other applications due to contention in accessing shared resources
+Meaning of interference: is the overhead generated in an aplication running in a consolidated environemnt with other applications due to contention in accessing shared resources.
 
 # How to install IntP
 
