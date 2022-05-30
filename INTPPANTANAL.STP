@@ -1,0 +1,660 @@
+#!/usr/bin/stap
+
+global interval = 1
+
+probe begin
+{	
+	printf("Tracing block I/O for processes named \"%s\". Monitoring will process as soon as the application begin\n", @1);
+	
+	perf_global_start()
+}
+
+####
+#	startup syscall
+####
+
+global runtime_procfs = 0
+global initial_time = 0, runtime = 0
+global started = 0, exited = 0
+global exitcounter = 0
+
+global mpids
+global nprocs = 0
+
+probe process(@1).begin, process(@1).thread.begin {
+	if (initial_time == 0) {
+		initial_time = gettimeofday_ns();
+	}
+	
+	_pid = pid()
+
+	if (tid() > 0 && tid() != pid()) {
+		_pid = tid()
+	}
+
+	if(!([_pid] in mpids)) {
+		printf(" Begin Create monitoring process: (%4d) %s %s\n", _pid, execname(), cmdline_str())
+		mpids[_pid] = 0
+		nprocs++
+		started = 1
+		exitcounter = 0
+		exited = 0
+		
+		#LLC occ
+		ue = perf_kernel_start(-1, _pid, 9, 1);
+		if(ue != 0) {llc_events[_pid] = ue}
+	}
+}
+
+probe process(@1).end, process(@1).thread.end {
+
+	if([pid()] in mpids) {
+		printf(" End monitoring process: (%4d) %s\n", pid(), execname()); 	
+		delete mpids[pid()]
+		nprocs--
+
+		if(nprocs == 0) {
+			exited = 0
+		}
+		if([pid()] in llc_events) {
+			perf_kernel_stop(llc_events[pid()])
+			delete llc_events[pid()]
+		}
+	} 
+	if([tid()] in mpids) {
+		printf(" End monitoring process: (%4d) %s\n", tid(), execname()); 	
+		delete mpids[tid()]
+		nprocs--
+
+		if(nprocs == 0) {
+			exited = 0
+		}
+		if([tid()] in llc_events) {
+			perf_kernel_stop(llc_events[tid()])
+			delete llc_events[tid()]
+		}
+	}
+}
+
+#probe kprocess.create {
+#	if (pid() != new_pid) {
+#		if([pid()] in mpids) {
+#			printf("Kprocess process create: (%4d) %4d %s\n", pid(), new_pid, execname()); 				
+#			mpids[new_pid] = 0
+#		
+#			#LLC occ
+#			#ue = perf_kernel_start(1, new_pid, 8, 1);
+#			#if(ue != 0) {llc_events[new_pid] = ue}
+#		}
+#	}
+#}
+
+####
+#	Block IO call statistics
+####
+
+global block_op_dep
+global block_tput, block_cput
+
+global block_queued_time, block_srv_time
+
+probe kernel.trace("block_rq_complete") {
+	data_len = $rq->__data_len
+	block_tput <<< data_len
+	block_cput <<< data_len
+	
+	if (data_len > 0) {
+		time = local_clock_ns();
+		start_time_ns = $rq->start_time_ns
+		io_start_time_ns = $rq->io_start_time_ns
+
+		if(($rq->start_time_ns - io_start_time_ns) < 0) {
+			block_queued_time <<< io_start_time_ns - start_time_ns
+		}
+		if($rq->io_start_time_ns > 0 && (io_start_time_ns - time) < 0) {
+			block_srv_time <<< (time - io_start_time_ns)
+		}
+		block_op_dep += 1
+	}
+}
+
+function print_block_report()
+{
+    if(@count(block_srv_time)) {svctm = @avg(block_srv_time)} else {svctm = 0}
+    
+    block_op_dep = block_op_dep/runtime_procfs
+    svctm = svctm/runtime_procfs
+    svctm_ms = (svctm/1000/1000)/100
+    svctm_ms_abs = (svctm/1000/1000)%100
+    util = ((svctm/1000/1000) * block_op_dep)/100   
+    util_abs = ((svctm/1000/1000) * block_op_dep)%100
+    if(util > 100) {util = 100;	util_abs = 0}
+	if(util_abs >= 100) {util_abs=util_abs/10}
+	
+	printf("# ioblock %d %d %d.%.2d: %d.%02d%%\n", svctm, block_op_dep, svctm_ms, svctm_ms_abs, util, util_abs)
+	
+	if(util>=100){
+		util=99
+	}
+
+	delete block_op_dep
+	delete block_queued_time
+	delete block_srv_time
+	return util
+}
+
+####
+#	Network statistics
+####
+
+global net_tput
+global flows
+
+probe netfilter.ip.local_out {
+	if(([pid()] in mpids) && length > 0) {
+		net_tput <<< length	
+		if(!([saddr,daddr,dport] in flows))
+			flows[saddr,daddr,dport] = pid()
+	}
+}
+
+probe netfilter.ip.local_in {
+	if(([daddr,saddr,sport] in flows) && length > 0) {
+		net_tput <<< length
+	}
+}
+
+global net_sent_req
+global net_sent_lat
+global skb_queue_start_t
+
+probe kernel.function("__dev_queue_xmit")
+{
+	if ($skb->truesize>0) {
+		skb_queue_start_t[$skb] = gettimeofday_ns();
+	}
+}
+
+probe kernel.trace("net_dev_xmit")
+{
+	if ($skb->len>0) {
+		t = gettimeofday_ns();
+		st = skb_queue_start_t[$skb]
+		if (st) {
+			net_sent_lat <<< t - st
+			net_sent_req += 1
+			delete skb_queue_start_t[$skb]
+		}
+	}
+}
+
+global net_rcv_req
+global net_rcv_lat
+global skb_rcv_queue_start_t
+
+probe kernel.function("__napi_schedule_irqoff")
+{
+	skb_rcv_queue_start_t[n] = gettimeofday_ns();  //$n
+}
+
+probe kernel.function("napi_complete_done")
+{
+	t = gettimeofday_ns();
+	st = skb_rcv_queue_start_t[$n]
+	if (st) {
+		net_rcv_lat <<< t - st
+		net_rcv_req += 1
+		delete skb_rcv_queue_start_t[$n]
+	}
+}
+
+function print_netstack_report()
+{
+	if(@count(net_sent_lat)) {_net_sent_lat = @avg(net_sent_lat)} else { _net_sent_lat = 0}
+	if(@count(net_rcv_lat)) {_net_rcv_lat = @avg(net_rcv_lat)} else { _net_rcv_lat = 0}   
+    
+    rcv_util = (_net_rcv_lat * net_rcv_req)/1000/1000/1000
+    rcv_util_abs = ((_net_rcv_lat * net_rcv_req)/1000/1000/1000)%1000
+    sent_util = (_net_sent_lat * net_sent_req)/1000/1000/1000
+    sent_util_abs = ((_net_sent_lat * net_sent_req)/1000/1000/1000)%1000   
+    util = rcv_util + sent_util + ((rcv_util_abs+sent_util_abs)/100)
+    util_abs = ((rcv_util_abs+sent_util_abs)%100)
+    
+    if(util > 100) {util = 100;	util_abs = 0}
+	if(util_abs >= 100) {util_abs=util_abs/10}
+	
+	//printf("# netstack %d %d %d %d: %d.%02d%%\n", net_sent_req, _net_sent_lat, net_rcv_req, _net_rcv_lat, util, util_abs)
+	
+	if(util>=100){
+		util=99
+	}
+
+	delete net_sent_lat
+	delete net_sent_req
+	delete net_rcv_lat
+	delete net_rcv_req
+	return util
+}
+
+function print_netphy_report()
+{
+	tput_eq = @sum(net_tput)/runtime_procfs
+	util = (tput_eq*10000/125000000)/100
+	util_abs = (tput_eq*10000/125000000)%100
+	
+	//printf("# netphy %d %d: %d.%02d%%\n", runtime_s, @sum(net_tput), util, util_abs)
+	
+	if(util>=100){
+		util=99
+	}
+
+	delete net_tput
+	return util
+}
+
+####
+#	CPU statistics
+####
+
+global uticks, kticks, ticks
+
+probe perf.sw.cpu_clock!, timer.profile {
+	if([tid()] in mpids) {
+		if (!user_mode())
+			kticks <<< 1
+		else
+			uticks <<< 1
+	}
+
+	ticks <<< 1
+}
+
+function print_cpu_report()
+{
+	allticks = @count(ticks)
+	uscaled = @count(uticks)*10000/allticks
+	kscaled = @count(kticks)*10000/allticks
+	
+	//printf ("# cpu %d: %d.%02d%% %d.%02d%%\n", allticks, uscaled/100, uscaled%100, kscaled/100, kscaled%100)
+	
+	delete uticks
+	delete kticks
+	delete ticks
+	if (((uscaled/100) + (kscaled/100)) >= 100) {
+		return 99
+	}else{
+		return (uscaled/100) + (kscaled/100)
+	}
+}
+
+####
+#	Context switch 
+####
+
+#global sched_csw_start_t
+#global sched_csw_lat
+
+#probe scheduler.ctxswitch
+#{
+#	if([next_pid] in sched_csw_start_t) {
+#		sched_csw_lat <<< gettimeofday_ns() - sched_csw_start_t[next_pid]
+#		//printf("next: pid %d, priority %d, state %d, task_name %s, tid %d\n", next_pid, next_priority, nexttsk_state, next_task_name, next_tid)
+#	}	
+#
+#	if([prev_pid] in mpids) {
+#		sched_csw_start_t[prev_pid] = gettimeofday_ns()
+#		//printf("prev: pid %d, priority %d, state %d, task_name %s, tid %d\n", prev_pid, prev_priority, prevtsk_state, prev_task_name, prev_tid)
+#	}
+#}
+
+#function print_csw_report()
+#{
+#	if(@count(sched_csw_lat)) {_sched_csw_lat = @avg(sched_csw_lat)} else { _sched_csw_lat = 0}
+#	if(@count(sched_csw_lat)) {_sched_csw_counter = @count(sched_csw_lat)} else { _sched_csw_counter = 0}
+#
+#    printf("# csw %d %d\n", _sched_csw_counter, _sched_csw_lat)
+#
+#    delete sched_csw_lat
+#}
+
+####
+#	uncore statistics
+####
+
+global uncore_events
+global uncore_imc_ctr
+
+%{
+#include <linux/perf_event.h>
+#include <linux/unistd.h>
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/syscalls.h>
+#include <linux/delay.h>
+#include <asm/paravirt.h>
+
+asmlinkage long (*perf_op) (struct perf_event_attr __user *attr_uptr, pid_t pid, int cpu, int group_fd, unsigned long flags);
+asmlinkage long (*read_op) (unsigned int fd, char __user *buf, size_t count);
+asmlinkage long (*close_op) (unsigned int fd);
+
+#define MSR_IA32_QM_CTR		0x0c8e
+#define MSR_IA32_QM_EVTSEL	0x0c8d
+#define QOS_L3_OCCUP_EVENT_ID	0x01
+
+#define RMID_VAL_ERROR		(1ULL << 63)
+#define RMID_VAL_UNAVAIL	(1ULL << 62)
+#define INVALID_RMID		(-1)
+
+static cpumask_t cqm_cpumask;
+
+struct rmid_read_s {
+	u32 rmid;
+	u32 evt_type;
+	atomic64_t value;
+};
+
+static void rmid_read_data(void *info);
+static u64 rmid_read(struct perf_event *pe);
+
+static void rmid_read_data (void *info)
+{
+	u64 val;
+	struct rmid_read_s *rr;
+	rr = info;
+	
+	wrmsr(MSR_IA32_QM_EVTSEL, QOS_L3_OCCUP_EVENT_ID, rr->rmid);
+	rdmsrl(MSR_IA32_QM_CTR, val);
+	
+	if (val & (RMID_VAL_ERROR | RMID_VAL_UNAVAIL)) {
+		return;
+	}
+		
+	atomic64_add(val, &rr->value);
+}
+
+static u64 rmid_read (struct perf_event * pe)
+{
+	u64 val;
+
+	struct rmid_read_s rr = {
+		.evt_type = pe->attr.config,
+		.value = ATOMIC64_INIT(0),
+	};
+	
+	rr.rmid = pe->hw.cqm_rmid;
+	
+	if (!rr.rmid || rr.rmid == INVALID_RMID)
+		goto out;
+	
+	cpumask_set_cpu(0, &cqm_cpumask);
+	cpumask_set_cpu(1, &cqm_cpumask);
+
+	on_each_cpu_mask(&cqm_cpumask, rmid_read_data, &rr, 1);
+	
+	if (pe->hw.cqm_rmid == rr.rmid) {
+		local64_set(&pe->count, atomic64_read(&rr.value));
+		//val = atomic64_read(&rr.value);
+	}
+out:
+	return local64_read(&pe->count);
+}
+
+%}
+
+function perf_kernel_start:long (cpu, task, type, config) %{
+	struct perf_event_attr pe;
+	struct perf_event *ev;
+	struct task_struct *p = NULL;
+
+	memset(&pe, 0, sizeof(struct perf_event_attr));
+    pe.type = STAP_ARG_type;
+    pe.size = sizeof(struct perf_event_attr);
+    pe.config = STAP_ARG_config;
+    //pe.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED|PERF_FORMAT_TOTAL_TIME_RUNNING;
+    pe.inherit = 0;
+    pe.enable_on_exec = 0;
+	pe.disabled = 0;
+	
+	local_irq_enable();
+
+	if(STAP_ARG_task != -1) {
+		p = (struct task_struct *)pid_task(find_vpid((int)STAP_ARG_task), PIDTYPE_PID);
+		if(!p) {
+			STAP_PRINTF("Task not found\n");
+		}
+		STAP_PRINTF("Perf event task sucessfuly created (%d)\n",p->pid);
+		ev = (struct perf_event *) perf_event_create_kernel_counter(&pe, STAP_ARG_cpu, p, NULL, NULL);
+	} else {
+		ev = (struct perf_event *) perf_event_create_kernel_counter(&pe, STAP_ARG_cpu, NULL, NULL, NULL);
+	}
+	CATCH_DEREF_FAULT();
+
+	if (IS_ERR(ev)) {
+		STAP_RETURN(0);
+		STAP_PRINTF("Perf event registration error %lu\n", (long) PTR_ERR(ev));
+	} 
+		
+	STAP_PRINTF("Perf event sucessfuly registered cpu(%d)\n", STAP_ARG_cpu);
+	STAP_RETVALUE = (long) ev;
+%}
+
+
+function perf_kernel_stop:long (event) %{
+	int val;
+	val = perf_event_release_kernel((struct perf_event *)((long)STAP_ARG_event));	
+	STAP_PRINTF("Perf event sucessfuly unregistered %d\n", val);
+%}
+
+
+function perf_kernel_read:long (event) %{
+	u64 enabled, running;
+	u64 ev;
+	unsigned long flags;
+	
+	ev = (u64) perf_event_read_value ((struct perf_event *)STAP_ARG_event, &enabled, &running);
+
+	//STAP_PRINTF("READ Value -> %lu %lu %lu",ev, enabled, running);
+	
+	STAP_RETVALUE = ev;
+	CATCH_DEREF_FAULT();
+%}
+
+
+function perf_rmid_read:long (event) %{
+	struct perf_event * event;
+	u64 val;
+	
+	event = (struct perf_event *)STAP_ARG_event;
+	
+	//preempt_disable();
+	local_irq_enable();
+	val = rmid_read(event);
+	//preempt_enable();
+	
+	//STAP_PRINTF("value -> %lu\n", val);
+	
+	STAP_RETVALUE = val;
+	CATCH_DEREF_FAULT();
+%}
+
+
+function perf_kernel_reset:long (event) %{
+	struct perf_event * ev = (struct perf_event *)STAP_ARG_event;
+	local64_set(&ev->count, 0);
+%}
+
+function perf_global_start()
+{
+	# uncore imc events
+	ue = perf_kernel_start(0, -1, 14, 0x0304);
+	if(ue != 0) {uncore_events[0] = ue}
+	ue = perf_kernel_start(0, -1, 14, 0x0c04);
+	if(ue != 0) {uncore_events[1] = ue}
+	ue = perf_kernel_start(1, -1, 14, 0x0304);
+	if(ue != 0) {uncore_events[2] = ue}
+	ue = perf_kernel_start(1, -1, 14, 0x0c04);
+	if(ue != 0) {uncore_events[3] = ue}
+}
+
+function perf_global_stop()
+{		
+	foreach ([p] in uncore_events)
+		perf_kernel_stop(uncore_events[p])
+		delete uncore_events[p]
+}
+
+function print_mem_report()
+{
+		foreach ([p] in uncore_events)
+			uncore_imc_ctr <<< perf_kernel_read(uncore_events[p])
+		
+		bw = @sum(uncore_imc_ctr)*64/runtime_procfs
+		
+		bw_norm = ((bw*10000)/34000000000)/100;
+		bw_norm_ma =  (bw*10000/34000000000)%100
+		
+		# bw bw_norm
+		//printf("# imc %d: %d.%02d%% ----- %ld --- %ld \n", bw, bw_norm, bw_norm_ma, @sum(uncore_imc_ctr), runtime_procfs)
+		
+		foreach ([p] in uncore_events)
+			perf_kernel_reset(uncore_events[p])
+
+
+		if (bw_norm >= 100) {
+			bw_norm = 99
+		}
+
+		delete uncore_imc_ctr
+		return bw_norm
+}
+
+
+####
+#	LLC statistics
+####
+
+global llc_events
+
+global llc_load, llc_load_misses
+global llc_load_t, llc_load_misses_t
+global llc_occ, llc_occ_t
+
+probe perf.type(3).config(0x000002).process(@1){llc_load <<< 1; llc_load_t+=1}
+probe perf.type(3).config(0x010002).process(@1){llc_load_misses <<< 1; llc_load_misses_t+=1}
+
+function print_cache_report()
+{
+	if(@count(llc_load)){_llc_load=@sum(llc_load)}else{_llc_load = 0}
+	if(@count(llc_load_misses)){_llc_load_misses=@sum(llc_load_misses)}else{_llc_load_misses = 0}
+	
+	llc_miss_ratio=0
+	llc_miss_ratio_ma=0
+
+	if(_llc_load > 0) {
+		llc_miss_ratio = ((_llc_load_misses*10000)/_llc_load)/100;
+		llc_miss_ratio_ma =  (_llc_load_misses*10000/_llc_load)%100
+	}
+	
+//	printf("# llc %ld %ld %ld %ld: %d.%02d%%\n", _llc_load, _llc_load_misses, llc_load_t, llc_load_misses_t, llc_miss_ratio, llc_miss_ratio_ma)
+//	printf(" -  %d.%02d%%;%ld\n", llc_miss_ratio, llc_miss_ratio_ma, @sum(llc_occ) * 24576)
+
+
+	if (llc_miss_ratio >= 100) {
+		llc_miss_ratio = 99
+	}
+
+	delete llc_load
+	delete llc_load_misses
+	
+	return llc_miss_ratio
+}
+
+function print_llc_report()
+{
+	foreach ([p] in llc_events) {
+		#printf("PID %d ",[p]);
+		llc_occ <<< perf_rmid_read(llc_events[p])
+		#printf("PID %d  --- %ld \n",[p],perf_rmid_read(llc_events[p]));
+	}
+	
+	total = @sum(llc_occ) * 49152   //27033    //24576
+	total_norm = ((total*10000)/34000000)/100
+	total_norm_ma = ((total*10000)/34000000)%100
+	
+	if (total_norm >= 100) {
+		total_norm = 99
+	}
+
+	//printf("# llc %ld ---- %ld\n", total, total_norm)
+	
+	delete llc_occ
+	return total_norm
+}
+
+probe procfs("intestbench").read 
+{
+	if(runtime_procfs > 0) {
+	
+		netphy_util = print_netphy_report()
+		block_util = print_block_report()
+		netstak_util = print_netstack_report()
+		mem_util = print_mem_report()
+		cpu_util = print_cpu_report()
+		cache_ratio = print_cache_report()
+		cache_occ = print_llc_report()
+
+		buff = sprintf("netp\tnets\tblk\tmbw\tllcmr\tllcocc\tcpu\n%02d\t%02d\t%02d\t%02d\t%02d\t%02d\t%02d\n",
+						netphy_util, 
+						netstak_util,
+						block_util,
+						mem_util,
+						cache_ratio,
+						cache_occ,
+						cpu_util);
+		
+		runtime_procfs = 0
+
+		$value = buff
+	}
+}
+
+probe timer.s(1) {
+	
+	if(exited == 0) {
+		runtime = gettimeofday_ns() - initial_time
+		runtime_procfs = runtime_procfs + interval
+	}
+	
+	if(started == 1) {
+//		printf("\n")
+//		print_block_report()
+//		print_netstack_report()
+//		print_netphy_report()
+//		print_mem_report()
+//		print_csw_report()
+//		print_cpu_report()
+//		print_cache_report()
+//		print_llc_report()
+	}
+
+	if(exited == 1) {
+
+		#started = 0
+		exitcounter++
+		
+		printf("Waiting %d seconds to exit \n", exitcounter);
+
+		if(exitcounter == 30) {
+			exit()
+		}
+	}
+}
+
+probe end
+{
+	perf_global_stop()
+	
+	printf("\n\nruntime: %d ns\n", runtime)
+	printf("\nExiting son0 on %s\n", ctime(gettimeofday_s()))
+}
