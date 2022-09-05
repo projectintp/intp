@@ -20,3 +20,9 @@ To take IntP return it is needed to open a second shell terminal and type anothe
 
 
  watch -n2 -d cat /proc/systemtap/stap_*/intestbench
+
+# Contributors
+[@mclsylva](https://github.com/mclsylva)
+
+[@superflit](https://github.com/superflit)
+
