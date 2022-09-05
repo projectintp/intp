@@ -6,7 +6,7 @@ Meaning of interference: is the overhead generated in an aplication running in a
 
 # How to Install IntP
 
-[Installation Guide](https://github.com/projectintp/intp/blob/main/install/install.md)
+[Installation Guide - Red Hat Based Distribution](https://github.com/projectintp/intp/blob/main/install/install.md)
 
 # How to Use IntP
 
