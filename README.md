@@ -8,6 +8,8 @@ Meaning of interference: is the overhead generated in an aplication running in a
 
 [Installation Guide - Red Hat Based Distribution](https://github.com/projectintp/intp/blob/main/install/install_redhat_dist.md)
 
+[Installation Guide - Debian Based Distribution](https://github.com/projectintp/intp/blob/main/install/install_debian_dist.md)
+
 # How to Use IntP
 
 IntP is a probing tool that allows users to monitor the activities of the computer system with more detail. It is important to note that IntP runs in kernel-space, so it is possible to provide analysis over a specific application in fine detail. Assuming the user or programmer wants to monitor a specific application with a higher level of details. IntP works such as a listener, which hears only the chosen application and collects all the interactions made by the application over the hardware. The execution of IntP is similar to other tools like top or netstat, but there is a significant difference between them, IntP does not work with just only one command. To execute IntP, at least two commands have to be executed and consequently two shell terminals have to be used. The command which was used for monitoring an application with IntP is:
