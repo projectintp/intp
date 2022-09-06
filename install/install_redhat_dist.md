@@ -1,4 +1,4 @@
-# IntP INSTALLATION GUIDE
+# IntP INSTALLATION GUIDE FOR RED HAT BASED DISTRIBUTION
 
 <b>IntP</b> is based in <b>SYSTEMTAP</b>, to install <b>SYSTEMTAP</b> and execute <b>IntP</b> follows the steps below:
 
