@@ -20,41 +20,35 @@ In my case is the version 5.10.113.
       
     $ apt-get update
     
-3 - Now is necessary to install the debugging and headers packages:
+3 - Install Systemtap:
 
-    $ apt-get install linux-image-$(uname -r)-dbg
+    $ apt-get install systemtap
     
-    $ apt-get install linux-headers-`uname -r`
+4 - Install SystemTap dependencies:
+    
+    $ apt-get install make g++ python gettext libdw-dev
+    $ apt-get install intel-cmt-cat
+    $ stap-prep
 
 4 - Restart the server after the installation to apply debugging and headers packages:
 
-    $ init 6
+    $ reboot
 
 5 - Verify the version of the debugging packages (needs to be the same kernel version):
 
-    $ apt-get list | grep linux-image-$(uname -r)-dbg
+    $ apt list | grep linux-image-$(uname -r)-dbg
     linux-image-5.10.0-14-cloud-amd64-dbg/stable-security,now 5.10.113-1 amd64 [installed]
     
-In my case the kernel version is 5.10.113.
-
-6 - Install SYSTEMTAP packages:
-
-    $ apt-get install -y systemtap
-    
-7 - Install  make, c++, python, gettext and libdw-dev packages:
-
-    $ apt-get install make g++ python gettext libdw-dev
-    
-8 - Run the command below to test SYSTEMTAP:
+6 - Run the command below to test SYSTEMTAP:
 
     $ stap -e 'probe begin { log("hello world") exit () }'
 
 After install <b>SYSTEMTAP</b> is possible to execute <b>IntP</b>:
 
-9 - Execute IntP:
+7 - Execute IntP:
 
     $ stap --suppress-handler-errors -g intp.stp _ApplicationName_
 
-10 - Open a second terminal and execute the command below to see the IntP return:
+8 - Open a second terminal and execute the command below to see the IntP return:
     
     $ watch -n2 -d cat /proc/systemtap/stap_*/intestbench
